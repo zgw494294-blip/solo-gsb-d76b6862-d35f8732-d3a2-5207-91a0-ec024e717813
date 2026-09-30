@@ -456,3 +456,72 @@ class ReceivingReconcileResponse(BaseModel):
     unassigned_indices: list[int]  # 未分配的有效(且非重复)扫描下标
     duplicate_indices: list[int]  # 同 GTIN+AI21 序列号的后续重复扫描下标
     lines: list[ReceivingLineRemaining]  # 各期望行剩余数量,保持输入顺序
+
+
+# ---------- 召回实物追溯 (/v1/recall/custody-trace) ----------
+
+
+class TraceEventBase(BaseModel):
+    """交接 / 装拆事件的公共字段:带时区的发生时间。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    occurred_at: datetime
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _occurred_at_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
+            raise ValueError("occurred_at 须带时区信息")
+        return v
+
+
+class TraceHandoffEvent(TraceEventBase):
+    """交接事件:仅作用于无父件实物(容器交接连带其全部后代更换持有人)。"""
+
+    action: Literal["handoff"]
+    scan: str
+    from_location: str | None  # 必填但可为 null;实物首次交接须为 null
+    to_location: str = Field(min_length=1)
+
+
+class TraceLinkEvent(TraceEventBase):
+    """装入 / 取出事件:父件与子件均以含 AI 21 的库存扫描串识别。"""
+
+    action: Literal["pack", "unpack"]
+    parent_scan: str
+    child_scan: str
+
+
+TraceEvent = Annotated[
+    TraceHandoffEvent | TraceLinkEvent,
+    Field(discriminator="action"),
+]
+
+
+class RecallCustodyTraceRequest(BaseModel):
+    """召回实物追溯请求:1~100 条库存扫描 + 召回规则 + 1~200 条交接 / 装拆事件。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scans: list[str] = Field(min_length=1, max_length=100)  # 库存扫描,须合法、含 AI 21 且 GTIN+序列号唯一
+    rules: list[Rule] = Field(min_length=1, max_length=100)  # 召回规则,同召回核验
+    events: list[TraceEvent] = Field(min_length=1, max_length=200)  # 按 UTC 升序、同刻输入顺序重放
+
+    @field_validator("rules")
+    @classmethod
+    def _rule_ids_unique(cls, v: list[Rule]) -> list[Rule]:
+        return _ensure_unique_rule_ids(v)
+
+
+class RecallCustodyTraceItem(BaseModel):
+    """一件命中召回的库存实物及其经过的保管地点。"""
+
+    gtin: str
+    serial: str
+    locations: list[str]  # 成功交接首次到达顺序去重的保管地点(含容器交接时随后代到达)
+
+
+class RecallCustodyTraceResponse(BaseModel):
+    items: list[RecallCustodyTraceItem]  # 命中召回的库存实物,按 GTIN、序列号排序
+    errors: list[CustodyEventError]  # 未生效事件的原下标与原因,按原下标排序
