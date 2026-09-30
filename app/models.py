@@ -456,3 +456,82 @@ class ReceivingReconcileResponse(BaseModel):
     unassigned_indices: list[int]  # 未分配的有效(且非重复)扫描下标
     duplicate_indices: list[int]  # 同 GTIN+AI21 序列号的后续重复扫描下标
     lines: list[ReceivingLineRemaining]  # 各期望行剩余数量,保持输入顺序
+
+
+# ---------- 召回实物保管地点追溯 (/v1/recall/location-trace) ----------
+
+
+class _TraceEventBase(BaseModel):
+    """交接 / 装拆事件的公共字段:occurred_at 须为带时区的 ISO 8601 时间。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    occurred_at: datetime
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _occurred_at_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
+            raise ValueError("occurred_at 须带时区信息")
+        return v
+
+
+class TraceTransferEvent(_TraceEventBase):
+    """交接事件:仅作用于无父件实物;首次 from_location 为 null,此后须等于当前持有人。"""
+
+    action: Literal["transfer"]
+    scan: str
+    from_location: str | None  # 必填但可为 null;实物首次成功交接须为 null
+    to_location: str = Field(min_length=1)
+
+
+class TracePackingEvent(_TraceEventBase):
+    """装入 / 取出事件:父件、子件均以含 AI 21 的 GS1 扫描串识别。"""
+
+    action: Literal["pack", "unpack"]
+    parent_scan: str
+    child_scan: str
+
+
+# 以 action 为判别字段的联合;非法 action / 字段缺失或多余均由 pydantic 返回 422
+TraceEvent = Annotated[
+    TraceTransferEvent | TracePackingEvent, Field(discriminator="action")
+]
+
+
+class LocationTraceRequest(BaseModel):
+    """地点追溯请求:1~100 条库存扫描 + 1~100 条召回规则 + 1~200 条交接 / 装拆事件。
+
+    库存扫描须全部合法、含 AI 21 且 GTIN+序列号唯一,否则整个请求返回 422;
+    事件扫描的合法性、库存引用与批号 / 有效期一致性按事件原下标报错,不生效。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scans: list[str] = Field(min_length=1, max_length=100)  # 库存扫描,须含 AI 21
+    rules: list[Rule] = Field(min_length=1, max_length=100)  # 召回规则,同召回核验
+    events: list[TraceEvent] = Field(min_length=1, max_length=200)  # 交接 / 装拆事件
+
+    @field_validator("rules")
+    @classmethod
+    def _rule_ids_unique(cls, v: list[Rule]) -> list[Rule]:
+        return _ensure_unique_rule_ids(v)
+
+
+class LocationTraceItem(BaseModel):
+    """一件命中召回的库存实物及其保管地点(按首次到达顺序去重)。"""
+
+    gtin: str
+    serial: str
+    locations: list[str]  # 按首次到达顺序去重的保管地点(含祖先容器交接带入的地点)
+    rule_ids: list[str]  # 命中的规则 ID,按规则输入顺序
+
+
+class LocationTraceEventError(BaseModel):
+    index: int  # 失败事件的原始下标
+    reason: str
+
+
+class LocationTraceResponse(BaseModel):
+    items: list[LocationTraceItem]  # 仅含命中召回的库存实物,按 GTIN、序列号排序
+    errors: list[LocationTraceEventError]  # 事件错误,按原始下标排序
